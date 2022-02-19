@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 
 use std::{
+    convert::Infallible,
     future::Future,
     marker::PhantomData,
     pin::Pin,
@@ -18,7 +19,7 @@ use xitca_service::{Service, ServiceFactory};
 pub fn handler_service<F, Req, T, O, Res, Err>(func: F) -> HandlerService<F, T, O, Res, Err>
 where
     F: for<'a> Handler<'a, Req, T, Response = O, Error = Err>,
-    O: for<'a> Responder<'a, Req, Output = Res>,
+    O: for<'a> FallibleResponder<'a, Req, Output = Res, Error = Err>,
 {
     HandlerService::new(func)
 }
@@ -32,7 +33,7 @@ impl<F, T, O, Res, Err> HandlerService<F, T, O, Res, Err> {
     pub fn new<Req>(func: F) -> Self
     where
         F: for<'a> Handler<'a, Req, T, Response = O, Error = Err>,
-        O: for<'a> Responder<'a, Req, Output = Res>,
+        O: for<'a> FallibleResponder<'a, Req, Output = Res, Error = Err>,
     {
         Self { func, _p: PhantomData }
     }
@@ -53,7 +54,7 @@ where
 impl<F, Req, T, O, Res, Err> ServiceFactory<Req> for HandlerService<F, T, O, Res, Err>
 where
     F: for<'a> Handler<'a, Req, T, Response = O, Error = Err>,
-    O: for<'a> Responder<'a, Req, Output = Res>,
+    O: for<'a> FallibleResponder<'a, Req, Output = Res, Error = Err>,
 {
     type Response = Res;
     type Error = Err;
@@ -69,7 +70,7 @@ where
 impl<F, Req, T, O, Res, Err> Service<Req> for HandlerService<F, T, O, Res, Err>
 where
     F: for<'a> Handler<'a, Req, T, Response = O, Error = Err>,
-    O: for<'a> Responder<'a, Req, Output = Res>,
+    O: for<'a> FallibleResponder<'a, Req, Output = Res, Error = Err>,
 {
     type Response = Res;
     type Error = Err;
@@ -91,7 +92,7 @@ where
     fn call(&self, mut req: Req) -> Self::Future<'_> {
         async move {
             let res = self.func.handle(&mut req).await?;
-            Ok(res.respond_to(&mut req).await)
+            Ok(res.respond_to(&mut req).await?)
         }
     }
 }
@@ -113,21 +114,24 @@ pub trait Handler<'a, Req, T>: Clone {
     fn handle(&'a self, req: &'a mut Req) -> Self::Future;
 }
 
-impl<'a, Req, T, Res, Err, F> Handler<'a, Req, T> for F
+impl<'a, Req, T, Args, O, Err, F, Res> Handler<'a, Req, T> for F
 where
-    T: FromRequest<'static, Req, Error = Err>,
-    F: AsyncFn<T::Type<'a>, Output = Res> + Clone,
-    F: AsyncFn<T>, // second bound to assist type inference to pinpoint T
+    ConcurrentExtractors<Args, Err>: FromRequest<'a, Req, Error = Err>,
+    F: AsyncFn<Args, Output = O> + Clone,
+    // ------
+    ConcurrentExtractors<T, Err>: FromRequest<'static, Req, Type<'a> = ConcurrentExtractors<Args, Err>>,
+    F: AsyncFn<T, Output = O>, // second bound to assist type inference to pinpoint T
+    O: FallibleResponder<'a, Req, Output = Res, Error = Err>,
 {
     type Error = Err;
-    type Response = Res;
+    type Response = O;
     type Future = impl Future<Output = Result<Self::Response, Self::Error>>;
 
     #[inline]
     fn handle(&'a self, req: &'a mut Req) -> Self::Future {
         async move {
-            let extract = T::Type::<'a>::from_request(req).await?;
-            Ok(self.call(extract).await)
+            let args = ConcurrentExtractors::<Args, Err>::from_request(req).await?.0;
+            Ok(self.call(args).await)
         }
     }
 }
@@ -147,15 +151,16 @@ pub trait FromRequest<'a, Req>: Sized {
     fn from_request(req: &'a Req) -> Self::Future;
 }
 
+struct ConcurrentExtractors<Data, Err>(Data, PhantomData<Err>);
+
 macro_rules! from_req_impl {
     ($fut: ident; $($req: ident),*) => {
-        impl<'a, Req, Err, $($req,)*> FromRequest<'a, Req> for ($($req,)*)
+        impl<'a, Req, Err, $($req,)*> FromRequest<'a, Req> for ConcurrentExtractors<($($req,)*), Err>
         where
-            $(
-                $req: FromRequest<'a, Req, Error = Err>,
-            )*
+            $($req: FromRequest<'a, Req>,)*
+            $(<$req as FromRequest<'a, Req>>::Error: Into<Err>,)+
         {
-            type Type<'r> = ($($req::Type<'r>,)*);
+            type Type<'r> = ConcurrentExtractors<($($req::Type<'r>,)*), Err>;
             type Error = Err;
             type Future = impl Future<Output = Result<Self, Self::Error>>;
 
@@ -166,23 +171,27 @@ macro_rules! from_req_impl {
                             fut: $req::from_request(req)
                         },
                     )+
+                    phantom: PhantomData::<Err>,
                 }
             }
         }
 
         pin_project! {
-            struct $fut<'f, Req, Err, $($req: FromRequest<'f, Req, Error = Err>),+>
-            {
+            struct $fut<'f, Req, Err, $($req: FromRequest<'f, Req>),+> {
                 $(
                     #[pin]
                     $req: ExtractFuture<$req::Future, $req>,
                 )+
+                phantom: PhantomData<Err>,
             }
         }
 
-        impl<'f, Req, Err, $($req: FromRequest<'f, Req, Error = Err>),+> Future for $fut<'f, Req, Err, $($req),+>
+        impl<'f, Req, Err, $($req,)+> Future for $fut<'f, Req, Err, $($req),+>
+        where
+            $($req: FromRequest<'f, Req>,)+
+            $(<$req as FromRequest<'f, Req>>::Error: Into<Err>,)+
         {
-            type Output = Result<($($req,)+), Err>;
+            type Output = Result<ConcurrentExtractors<($($req,)+), Err>, Err>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 let mut this = self.project();
@@ -190,7 +199,7 @@ macro_rules! from_req_impl {
                 let mut ready = true;
                 $(
                     match this.$req.as_mut().project() {
-                        ExtractProj::Future { fut } => match fut.poll(cx)? {
+                        ExtractProj::Future { fut } => match fut.poll(cx).map_err(Into::<Err>::into)? {
                             Poll::Ready(output) => {
                                 let _ = this.$req.as_mut().project_replace(ExtractFuture::Done { output });
                             },
@@ -202,14 +211,14 @@ macro_rules! from_req_impl {
                 )+
 
                 if ready {
-                    Poll::Ready(Ok(
-                        ($(
-                            match this.$req.project_replace(ExtractFuture::Empty) {
-                                ExtractReplaceProj::Done { output } => output,
-                                _ => unreachable!("FromRequest polled after finished"),
-                            },
-                        )+)
-                    ))
+                    let result = ($(
+                        match this.$req.project_replace(ExtractFuture::Empty) {
+                            ExtractReplaceProj::Done { output } => output,
+                            _ => unreachable!("FromRequest polled after finished"),
+                        },
+                    )+);
+
+                    Poll::Ready(Ok(ConcurrentExtractors(result, PhantomData::<Err>)))
                 } else {
                     Poll::Pending
                 }
@@ -242,6 +251,8 @@ from_req_impl! { Extract6; A, B, C, D, E, F }
 from_req_impl! { Extract7; A, B, C, D, E, F, G }
 from_req_impl! { Extract8; A, B, C, D, E, F, G, H }
 from_req_impl! { Extract9; A, B, C, D, E, F, G, H, I }
+/*
+*/
 
 /// Make Response with reference of Req.
 /// The Output type is what returns from [handler_service] function.
@@ -250,6 +261,27 @@ pub trait Responder<'a, Req> {
     type Future: Future<Output = Self::Output>;
 
     fn respond_to(self, req: &'a mut Req) -> Self::Future;
+}
+
+pub trait FallibleResponder<'a, Req> {
+    type Output;
+    type Error;
+    type Future: Future<Output = Result<Self::Output, Self::Error>>;
+
+    fn respond_to(self, req: &'a mut Req) -> Self::Future;
+}
+
+impl<'a, Req, T, Output> FallibleResponder<'a, Req> for T
+where
+    T: Responder<'a, Req, Output = Output>,
+{
+    type Output = Output;
+    type Error = Infallible;
+    type Future = impl Future<Output = Result<Output, Infallible>>;
+
+    fn respond_to(self, req: &'a mut Req) -> Self::Future {
+        async move { Ok(Responder::respond_to(self, req).await) }
+    }
 }
 
 #[doc(hidden)]
@@ -309,12 +341,46 @@ mod test {
     use crate::util::service::{get, Router};
     use crate::Request;
 
-    async fn handler(e1: String, e2: u32, (_, e3): (&Request<()>, u64)) -> StatusCode {
+    async fn handler(e1: String, e2: u32, req: &Request<()>, fallible: Host<'_>) -> Result<StatusCode, MyError> {
         assert_eq!(e1, "996");
         assert_eq!(e2, 996);
-        assert_eq!(e3, 996);
 
-        StatusCode::MULTI_STATUS
+        Ok(StatusCode::MULTI_STATUS)
+    }
+
+    #[derive(Debug)]
+    struct MyError;
+    struct HeaderError;
+    struct Host<'a>(&'a [u8]);
+
+    impl From<HeaderError> for MyError {
+        fn from(_: HeaderError) -> Self {
+            MyError
+        }
+    }
+
+    impl From<Infallible> for MyError {
+        fn from(_: Infallible) -> Self {
+            MyError
+        }
+    }
+
+    async fn fallible_handler(fallible_extractor: Host<'_>) -> Result<StatusCode, MyError> {
+        Ok(StatusCode::MULTI_STATUS)
+    }
+
+    impl<'a, T, E> FallibleResponder<'a, Request<()>> for Result<T, E>
+    where
+        T: FallibleResponder<'a, Request<()>>,
+        E: From<T::Error>,
+    {
+        type Output = T::Output;
+        type Error = E;
+        type Future = impl Future<Output = Result<Self::Output, Self::Error>>;
+
+        fn respond_to(self, req: &'a mut Request<()>) -> Self::Future {
+            async move { Ok(self?.respond_to(req).await?) }
+        }
     }
 
     impl<'a> Responder<'a, Request<()>> for StatusCode {
@@ -325,6 +391,19 @@ mod test {
             let mut res = Response::new(());
             *res.status_mut() = self;
             ready(res)
+        }
+    }
+
+    impl<'a> FromRequest<'a, Request<()>> for Host<'a> {
+        type Type<'f> = Host<'f>;
+        type Error = HeaderError;
+        type Future = impl Future<Output = Result<Self, Self::Error>>;
+
+        fn from_request(req: &'a Request<()>) -> Self::Future {
+            async {
+                let host = req.headers().get("Host").ok_or(HeaderError)?;
+                Ok(Host(host.as_ref()))
+            }
         }
     }
 
